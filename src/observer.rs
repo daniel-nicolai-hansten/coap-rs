@@ -10,7 +10,7 @@ use log::{debug, warn};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::time::interval;
@@ -20,6 +20,10 @@ use crate::server::Responder;
 
 const DEFAULT_UNACKNOWLEDGE_MESSAGE_TRY_TIMES: usize = 10;
 
+/// Thread-safe set of paths that are allowed to be observed.
+/// When empty, all paths are observable (backward-compatible).
+pub(crate) type ObservablePaths = Arc<RwLock<HashSet<String>>>;
+
 pub struct Observer {
     registers: HashMap<String, RegisterItem>,
     resources: HashMap<String, ResourceItem>,
@@ -27,6 +31,7 @@ pub struct Observer {
     unacknowledge_messages: HashMap<u16, UnacknowledgeMessageItem>,
     current_message_id: u16,
     timer: Fuse<IntervalStream>,
+    pub(crate) observable_paths: ObservablePaths,
 }
 
 #[derive(Debug)]
@@ -57,6 +62,11 @@ struct UnacknowledgeMessageItem {
 impl Observer {
     /// Creates an observer with channel to send message.
     pub fn new() -> Self {
+        Self::with_observable_paths(Arc::new(RwLock::new(HashSet::new())))
+    }
+
+    /// Creates an observer that shares an observable paths set.
+    pub(crate) fn with_observable_paths(observable_paths: ObservablePaths) -> Self {
         Self {
             registers: HashMap::new(),
             resources: HashMap::new(),
@@ -64,7 +74,23 @@ impl Observer {
             unacknowledge_messages: HashMap::new(),
             current_message_id: 0,
             timer: IntervalStream::new(interval(Duration::from_secs(1))).fuse(),
+            observable_paths,
         }
+    }
+
+    /// Checks whether the given path is allowed to be observed.
+    /// If no observable paths have been configured, all paths are allowed.
+    /// Otherwise the path must equal or be a sub-path of a registered observable path.
+    fn is_path_observable(&self, path: &str) -> bool {
+        let paths = self.observable_paths.read().unwrap();
+        if paths.is_empty() {
+            return true;
+        }
+        let normalized = path.trim_start_matches('/');
+        paths.iter().any(|p| {
+            let p_normalized = p.trim_start_matches('/');
+            normalized == p_normalized || normalized.starts_with(&format!("{}/", p_normalized))
+        })
     }
 
     /// poll the observer's timer.
@@ -139,6 +165,19 @@ impl Observer {
         let resource_path = request.get_path();
 
         debug!("register {} {}", register_address, resource_path);
+
+        // reply Forbidden if the path is not observable
+        if !self.is_path_observable(&resource_path) {
+            if let Some(ref response) = request.response.take() {
+                let mut response2 = response.clone();
+                response2.set_status(Status::Forbidden);
+                let msg_serial = response2.message.to_bytes();
+                if let Ok(b) = msg_serial {
+                    responder.respond(b).await;
+                }
+            }
+            return;
+        }
 
         // reply NotFound if resource doesn't exist
         if !self.resources.contains_key(&resource_path) {
@@ -253,6 +292,31 @@ impl Observer {
                 .register_resources
                 .iter()
                 .map(|k| k.clone())
+                .collect();
+        }
+
+        for register_resource_key in register_resource_keys {
+            self.gen_message_id();
+            self.notify_register_with_newest_resource(&register_resource_key)
+                .await;
+            self.record_unacknowledge_message(&register_resource_key);
+        }
+    }
+
+    /// Server-initiated notification: update (or create) a resource and notify all observers.
+    pub async fn notify(&mut self, path: &str, payload: &[u8]) {
+        let path_string = path.trim_start_matches('/').to_string();
+        let payload_vec = payload.to_vec();
+
+        debug!("server notify {} {:?}", path_string, payload_vec);
+
+        let register_resource_keys: Vec<String>;
+        {
+            let resource = self.record_resource(&path_string, &payload_vec);
+            register_resource_keys = resource
+                .register_resources
+                .iter()
+                .cloned()
                 .collect();
         }
 
@@ -734,5 +798,187 @@ mod test {
             result.is_err(),
             "Expected no notification after RST cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_server_notify() {
+        use async_trait::async_trait;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+        let mut observer = Observer::new();
+        let path = "test";
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+
+        struct MockResponder {
+            addr: SocketAddr,
+            tx: UnboundedSender<Vec<u8>>,
+        }
+
+        #[async_trait]
+        impl Responder for MockResponder {
+            async fn respond(&self, bytes: Vec<u8>) {
+                self.tx.send(bytes).unwrap();
+            }
+            fn address(&self) -> SocketAddr {
+                self.addr
+            }
+        }
+
+        // Use server-initiated notify to create the resource
+        observer.notify(path, b"initial").await;
+
+        let (tx, mut rx) = unbounded_channel();
+        let responder = Arc::new(MockResponder { addr, tx });
+
+        // Register an observer (CoapRequest::new() has no response, so no initial notification)
+        let mut register_req = CoapRequest::<SocketAddr>::new();
+        register_req.set_path(path);
+        register_req.set_method(Method::Get);
+        register_req.message.set_token(vec![0xAB]);
+        register_req.set_observe_flag(ObserveOption::Register);
+        register_req.source = Some(addr);
+
+        let forwarded = observer
+            .request_handler(&mut register_req, responder.clone())
+            .await;
+        assert!(!forwarded);
+
+        let key = format!("{}${}", addr, path);
+        assert!(observer.register_resources.contains_key(&key));
+
+        // Server pushes a new notification
+        observer.notify(path, b"updated").await;
+
+        let notif_bytes = rx.recv().await.unwrap();
+        let notif_pkt = Packet::from_bytes(&notif_bytes).unwrap();
+        assert_eq!(notif_pkt.payload, b"updated");
+        assert_eq!(notif_pkt.header.get_type(), MessageType::Confirmable);
+        assert_eq!(notif_pkt.get_token(), vec![0xAB]);
+    }
+
+    #[tokio::test]
+    async fn test_observable_path_restriction() {
+        use async_trait::async_trait;
+        use std::sync::RwLock;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+        let observable_paths: ObservablePaths =
+            Arc::new(RwLock::new(HashSet::from(["sensors".to_string()])));
+        let mut observer = Observer::with_observable_paths(observable_paths);
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+
+        struct MockResponder {
+            addr: SocketAddr,
+            tx: UnboundedSender<Vec<u8>>,
+        }
+
+        #[async_trait]
+        impl Responder for MockResponder {
+            async fn respond(&self, bytes: Vec<u8>) {
+                self.tx.send(bytes).unwrap();
+            }
+            fn address(&self) -> SocketAddr {
+                self.addr
+            }
+        }
+
+        // Create resources
+        observer.notify("sensors/temperature", b"20").await;
+        observer.notify("secret/data", b"hidden").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let responder = Arc::new(MockResponder {
+            addr,
+            tx: tx.clone(),
+        });
+
+        // Should succeed: "sensors/temperature" is under "sensors"
+        let mut register_req = CoapRequest::<SocketAddr>::new();
+        register_req.set_path("sensors/temperature");
+        register_req.set_method(Method::Get);
+        register_req.message.set_token(vec![1]);
+        register_req.set_observe_flag(ObserveOption::Register);
+        register_req.source = Some(addr);
+
+        let forwarded = observer
+            .request_handler(&mut register_req, responder.clone())
+            .await;
+        assert!(!forwarded);
+
+        let key = format!("{}${}", addr, "sensors/temperature");
+        assert!(observer.register_resources.contains_key(&key));
+
+        // Should be rejected: "secret/data" is not under "sensors"
+        let addr2: SocketAddr = "127.0.0.1:5684".parse().unwrap();
+        let (tx2, _rx2) = unbounded_channel();
+        let responder2 = Arc::new(MockResponder {
+            addr: addr2,
+            tx: tx2,
+        });
+        let mut register_req2 = CoapRequest::<SocketAddr>::new();
+        register_req2.set_path("secret/data");
+        register_req2.set_method(Method::Get);
+        register_req2.message.set_token(vec![2]);
+        register_req2.set_observe_flag(ObserveOption::Register);
+        register_req2.source = Some(addr2);
+
+        let forwarded = observer
+            .request_handler(&mut register_req2, responder2.clone())
+            .await;
+        // Observer handles it (returns false) but does NOT register
+        assert!(!forwarded);
+
+        let key2 = format!("{}${}", addr2, "secret/data");
+        assert!(
+            !observer.register_resources.contains_key(&key2),
+            "Forbidden path should not be registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_observable_paths_allows_all() {
+        use async_trait::async_trait;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+        // No observable paths configured → all paths allowed (backward compat)
+        let mut observer = Observer::new();
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+
+        struct MockResponder {
+            addr: SocketAddr,
+            tx: UnboundedSender<Vec<u8>>,
+        }
+
+        #[async_trait]
+        impl Responder for MockResponder {
+            async fn respond(&self, bytes: Vec<u8>) {
+                self.tx.send(bytes).unwrap();
+            }
+            fn address(&self) -> SocketAddr {
+                self.addr
+            }
+        }
+
+        observer.notify("any/path", b"data").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let responder = Arc::new(MockResponder { addr, tx });
+
+        let mut register_req = CoapRequest::<SocketAddr>::new();
+        register_req.set_path("any/path");
+        register_req.set_method(Method::Get);
+        register_req.message.set_token(vec![1]);
+        register_req.set_observe_flag(ObserveOption::Register);
+        register_req.source = Some(addr);
+
+        let forwarded = observer
+            .request_handler(&mut register_req, responder.clone())
+            .await;
+        // Should not be forwarded (observer handled registration)
+        assert!(!forwarded);
+
+        // Verify registration was successful
+        let key = format!("{}${}", addr, "any/path");
+        assert!(observer.register_resources.contains_key(&key));
     }
 }

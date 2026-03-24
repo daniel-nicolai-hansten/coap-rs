@@ -92,6 +92,7 @@ extern crate quickcheck;
 
 pub use self::client::UdpCoAPClient;
 pub use self::observer::Observer;
+pub use self::server::ObserverHandle;
 pub use self::server::Server;
 pub mod client;
 #[cfg(feature = "dtls")]

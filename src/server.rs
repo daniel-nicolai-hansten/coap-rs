@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use coap_lite::{BlockHandler, BlockHandlerConfig, CoapRequest, CoapResponse, Packet};
 use log::debug;
 use std::{
+    collections::HashSet,
     future::Future,
     io::ErrorKind,
     net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 use tokio::{
     io,
@@ -18,7 +19,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::observer::Observer;
+use crate::observer::{ObservablePaths, Observer};
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -338,9 +339,9 @@ impl ServerCoapState {
             _ => {}
         }
     }
-    pub fn new() -> Self {
+    pub fn new(observable_paths: ObservablePaths) -> Self {
         Self {
-            observer: Observer::new(),
+            observer: Observer::with_observable_paths(observable_paths),
             block_handler: BlockHandler::new(BlockHandlerConfig::default()),
             disable_observe: false,
         }
@@ -353,8 +354,35 @@ impl ServerCoapState {
 pub struct Server {
     listeners: Vec<Box<dyn Listener>>,
     coap_state: Arc<Mutex<ServerCoapState>>,
+    observable_paths: ObservablePaths,
     new_packet_receiver: TransportRequestReceiver,
     new_packet_sender: TransportRequestSender,
+}
+
+/// A clonable handle that allows server-initiated observe notifications
+/// and configuration of observable paths.
+#[derive(Clone)]
+pub struct ObserverHandle {
+    coap_state: Arc<Mutex<ServerCoapState>>,
+    observable_paths: ObservablePaths,
+}
+
+impl ObserverHandle {
+    /// Registers a path as observable, including all sub-paths.
+    /// Once at least one path is registered, only registered paths (and their
+    /// sub-paths) can be observed by clients. If no paths are registered, all
+    /// paths are observable (backward-compatible behaviour).
+    pub fn add_observable_path(&self, path: &str) {
+        let mut paths = self.observable_paths.write().unwrap();
+        paths.insert(path.to_string());
+    }
+
+    /// Sends a notification to all clients currently observing the given path.
+    /// The resource is created or updated with the provided payload.
+    pub async fn notify(&self, path: &str, payload: &[u8]) {
+        let mut state = self.coap_state.lock().await;
+        state.observer.notify(path, payload).await;
+    }
 }
 
 impl Server {
@@ -366,11 +394,22 @@ impl Server {
 
     pub fn from_listeners(listeners: Vec<Box<dyn Listener>>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let observable_paths: ObservablePaths = Arc::new(RwLock::new(HashSet::new()));
         Server {
             listeners,
-            coap_state: Arc::new(Mutex::new(ServerCoapState::new())),
+            coap_state: Arc::new(Mutex::new(ServerCoapState::new(observable_paths.clone()))),
+            observable_paths,
             new_packet_receiver: rx,
             new_packet_sender: tx,
+        }
+    }
+
+    /// Returns a clonable handle for configuring observable paths
+    /// and sending server-initiated notifications.
+    pub fn get_observer(&self) -> ObserverHandle {
+        ObserverHandle {
+            coap_state: self.coap_state.clone(),
+            observable_paths: self.observable_paths.clone(),
         }
     }
 
@@ -768,6 +807,56 @@ pub mod test {
                 .await
                 .unwrap(),
             Some(())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_observer_handle_notify() {
+        let path = "/sensors/temperature";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (port_tx, mut port_rx) = mpsc::unbounded_channel();
+
+        let _task = tokio::spawn(async move {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let listener = Box::new(UdpCoapListener::from_socket(sock));
+            let server = Server::from_listeners(vec![listener]);
+
+            let observer = server.get_observer();
+            // Create the resource before clients observe it
+            observer.notify(path, b"20").await;
+
+            port_tx.send(addr.port()).unwrap();
+
+            // Spawn a task that pushes a notification after a brief delay
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                observer.notify(path, b"21").await;
+            });
+
+            server.run(request_handler).await.unwrap();
+        });
+
+        let server_port = port_rx.recv().await.unwrap();
+
+        let client = UdpCoAPClient::new(format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+
+        client
+            .observe(path, move |msg| {
+                if msg.payload == b"21" {
+                    tx.send(()).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::new(5, 0), rx.recv())
+                .await
+                .unwrap(),
+            Some(()),
         );
     }
 
