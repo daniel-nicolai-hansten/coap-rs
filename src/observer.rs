@@ -78,6 +78,11 @@ impl Observer {
         }
     }
 
+    /// Normalizes a path by stripping leading slashes.
+    fn normalize_path(path: &str) -> &str {
+        path.trim_start_matches('/')
+    }
+
     /// Checks whether the given path is allowed to be observed.
     /// If no observable paths have been configured, all paths are allowed.
     /// Otherwise the path must equal or be a sub-path of a registered observable path.
@@ -86,9 +91,9 @@ impl Observer {
         if paths.is_empty() {
             return true;
         }
-        let normalized = path.trim_start_matches('/');
+        let normalized = Self::normalize_path(path);
         paths.iter().any(|p| {
-            let p_normalized = p.trim_start_matches('/');
+            let p_normalized = Self::normalize_path(p);
             normalized == p_normalized || normalized.starts_with(&format!("{}/", p_normalized))
         })
     }
@@ -291,7 +296,7 @@ impl Observer {
             register_resource_keys = resource
                 .register_resources
                 .iter()
-                .map(|k| k.clone())
+                .cloned()
                 .collect();
         }
 
@@ -305,7 +310,7 @@ impl Observer {
 
     /// Server-initiated notification: update (or create) a resource and notify all observers.
     pub async fn notify(&mut self, path: &str, payload: &[u8]) {
-        let path_string = path.trim_start_matches('/').to_string();
+        let path_string = Self::normalize_path(path).to_string();
         let payload_vec = payload.to_vec();
 
         debug!("server notify {} {:?}", path_string, payload_vec);
