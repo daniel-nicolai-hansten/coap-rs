@@ -1,10 +1,11 @@
+#[cfg(feature = "router")]
+use crate::router::{request::Request, Router};
 use async_trait::async_trait;
-use coap_lite::{BlockHandler, BlockHandlerConfig, CoapRequest, CoapResponse, Packet};
+use coap_lite::{BlockHandler, BlockHandlerConfig, CoapOption, CoapRequest, CoapResponse, Packet};
 use log::debug;
 use std::{
     collections::HashSet,
     future::Future,
-    io::ErrorKind,
     net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, RwLock},
 };
@@ -19,7 +20,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::observer::{ObservablePaths, Observer};
+use crate::observer::{encode_coap_uint, ObservablePaths, Observer};
 
 #[derive(Debug)]
 pub enum CoAPServerError {
@@ -122,21 +123,21 @@ impl UdpCoapListener {
     /// - To join multiple segments, you have to call enable_discovery for each of the segments.
     ///
     /// Some Multicast address scope
-    /// IPv6        IPv4 equivalent[16]	        Scope	            Purpose
-    /// ffx1::/16	127.0.0.0/8	                Interface-local	    Packets with this destination address may not be sent over any network link, but must remain within the current node; this is the multicast equivalent of the unicast loopback address.
-    /// ffx2::/16	224.0.0.0/24	            Link-local	        Packets with this destination address may not be routed anywhere.
-    /// ffx3::/16	239.255.0.0/16	            IPv4 local scope
-    /// ffx4::/16	            	            Admin-local	        The smallest scope that must be administratively configured.
-    /// ffx5::/16		                        Site-local	        Restricted to the local physical network.
-    /// ffx8::/16	239.192.0.0/14	            Organization-local	Restricted to networks used by the organization administering the local network. (For example, these addresses might be used over VPNs; when packets for this group are routed over the public internet (where these addresses are not valid), they would have to be encapsulated in some other protocol.)
-    /// ffxe::/16	224.0.1.0-238.255.255.255	Global scope	    Eligible to be routed over the public internet.
+    /// IPv6        IPv4 equivalent[16]            Scope                Purpose
+    /// ffx1::/16    127.0.0.0/8                    Interface-local        Packets with this destination address may not be sent over any network link, but must remain within the current node; this is the multicast equivalent of the unicast loopback address.
+    /// ffx2::/16    224.0.0.0/24                Link-local            Packets with this destination address may not be routed anywhere.
+    /// ffx3::/16    239.255.0.0/16                IPv4 local scope
+    /// ffx4::/16                                Admin-local            The smallest scope that must be administratively configured.
+    /// ffx5::/16                                Site-local            Restricted to the local physical network.
+    /// ffx8::/16    239.192.0.0/14                Organization-local    Restricted to networks used by the organization administering the local network. (For example, these addresses might be used over VPNs; when packets for this group are routed over the public internet (where these addresses are not valid), they would have to be encapsulated in some other protocol.)
+    /// ffxe::/16    224.0.1.0-238.255.255.255    Global scope        Eligible to be routed over the public internet.
     ///
     /// Notable addresses:
-    /// ff02::1	    All nodes on the local network segment
-    /// ff0x::c	    Simple Service Discovery Protocol
-    /// ff0x::fb	Multicast DNS
-    /// ff0x::fb	Multicast CoAP
-    /// ff0x::114	Used for experiments
+    /// ff02::1        All nodes on the local network segment
+    /// ff0x::c        Simple Service Discovery Protocol
+    /// ff0x::fb    Multicast DNS
+    /// ff0x::fb    Multicast CoAP
+    /// ff0x::114    Used for experiments
     //    pub fn join_multicast(&mut self, addr: IpAddr) {
     //        self.udp_server.join_multicast(addr);
     //    }
@@ -148,7 +149,7 @@ impl UdpCoapListener {
             SocketAddr::V4(val) => {
                 match addr {
                     IpAddr::V4(ipv4) => {
-                        let i = val.ip().clone();
+                        let i = *val.ip();
                         self.socket.join_multicast_v4(ipv4, i).unwrap();
                         self.multicast_addresses.push(addr);
                     }
@@ -177,7 +178,7 @@ impl UdpCoapListener {
             SocketAddr::V4(val) => {
                 match addr {
                     IpAddr::V4(ipv4) => {
-                        let i = val.ip().clone();
+                        let i = *val.ip();
                         self.socket.leave_multicast_v4(ipv4, i).unwrap();
                         let index = self
                             .multicast_addresses
@@ -266,7 +267,7 @@ impl UdpCoapListener {
                 message =self.socket.recv_buf_from(&mut recv_vec)=> {
                     match message {
                         Ok((_size, from)) => {
-                            sender.send((recv_vec, Arc::new(UdpResponder{address: from, tx: self.response_sender.clone()}))).map_err( |_| std::io::Error::new(ErrorKind::Other, "server channel error"))?;
+                            sender.send((recv_vec, Arc::new(UdpResponder{address: from, tx: self.response_sender.clone()}))).map_err( |_| std::io::Error::other("server channel error"))?;
                         }
                         Err(e) => {
                             return Err(e);
@@ -275,7 +276,7 @@ impl UdpCoapListener {
                 },
                 response = self.response_receiver.recv() => {
                     if let Some((bytes, to)) = response{
-                        debug!("sending {:?} to {:?}", &bytes,  &to);
+                        debug!("sending {:?} to {:?}", bytes, to);
                         self.socket.send_to(&bytes, to).await?;
                     }
                     else {
@@ -325,18 +326,41 @@ impl ServerCoapState {
 
         let should_be_forwarded = self.observer.request_handler(request, responder).await;
         if should_be_forwarded {
-            return ShouldForwardToHandler::True;
+            ShouldForwardToHandler::True
         } else {
-            return ShouldForwardToHandler::False;
+            ShouldForwardToHandler::False
         }
     }
 
     pub async fn intercept_response(&mut self, request: &mut CoapRequest<SocketAddr>) {
-        match self.block_handler.intercept_response(request) {
-            Err(err) => {
-                let _ = request.apply_from_error(err);
+        let resource_path = request.get_path();
+
+        let is_block_fetch_for_observer = request.message.get_option(CoapOption::Block2).is_some()
+            && request.message.get_option(CoapOption::Observe).is_none()
+            && request.source.is_some()
+            && self
+                .observer
+                .is_observing(&request.source.unwrap(), &resource_path);
+
+        if is_block_fetch_for_observer {
+            if let Some((payload, etag)) =
+                self.observer.get_resource_payload_and_etag(&resource_path)
+            {
+                if let Some(ref mut response) = request.response {
+                    response.message.payload = payload.to_vec();
+                    response.message.clear_option(CoapOption::ETag);
+                    response.message.add_option(CoapOption::ETag, etag);
+                    // Prevent duplicate Size2 options, clear first.
+                    response.message.clear_option(CoapOption::Size2);
+                    response
+                        .message
+                        .add_option(CoapOption::Size2, encode_coap_uint(payload.len()));
+                }
             }
-            _ => {}
+        }
+
+        if let Err(err) = self.block_handler.intercept_response(request) {
+            let _ = request.apply_from_error(err);
         }
     }
     pub fn new(observable_paths: ObservablePaths) -> Self {
@@ -422,7 +446,7 @@ impl Server {
             let handle = listener.listen(sender.clone()).await?;
             handles.push(handle);
         }
-        return Ok(handles);
+        Ok(handles)
     }
 
     /// run the server.
@@ -432,10 +456,11 @@ impl Server {
         let handler_arc = Arc::new(handler);
         // receive an input, sync our cache / states, then call custom handler
         loop {
-            let (bytes, respond) =
-                self.new_packet_receiver.recv().await.ok_or_else(|| {
-                    std::io::Error::new(ErrorKind::Other, "listen channel closed")
-                })?;
+            let (bytes, respond) = self
+                .new_packet_receiver
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("listen channel closed"))?;
             if let Ok(packet) = Packet::from_bytes(&bytes) {
                 let mut request = Box::new(CoapRequest::<SocketAddr>::from_packet(
                     packet,
@@ -468,6 +493,23 @@ impl Server {
             }
         }
     }
+
+    #[cfg(feature = "router")]
+    pub async fn serve<S>(self, router: Router<S>) -> Result<(), io::Error>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        let router = Arc::new(router);
+        let handler = {
+            move |req| {
+                let r = router.clone();
+                let req = Request::new(req);
+                async move { r.handle(req).await.req }
+            }
+        };
+        self.run(handler).await
+    }
+
     async fn respond_to_request(req: Box<CoapRequest<SocketAddr>>, responder: Arc<dyn Responder>) {
         // if we have some reponse to send, send it
         if let Some(Ok(b)) = req.response.map(|resp| resp.message.to_bytes()) {
@@ -482,10 +524,14 @@ impl Server {
     pub async fn disable_observe_handling(&mut self, value: bool) {
         self.automatic_observe_handling(value).await
     }
-    /// set auto-observe handling in server, defaults to enabled
-    pub async fn automatic_observe_handling(&mut self, value: bool) {
+    /// Controls whether the server automatically handles observe options.
+    /// Automatic handling is on by default.
+    ///
+    /// Set `bypass` to `true` when your handler needs full control over
+    /// observe — the server will skip its built-in processing.
+    pub async fn automatic_observe_handling(&mut self, bypass: bool) {
         let mut coap_state = self.coap_state.lock().await;
-        coap_state.disable_observe_handling(value)
+        coap_state.disable_observe_handling(bypass)
     }
 }
 
@@ -528,13 +574,10 @@ pub mod test {
         let uri_path_list = req.message.get_option(CoapOption::UriPath).unwrap().clone();
         assert_eq!(uri_path_list.len(), 1);
 
-        match req.response {
-            Some(ref mut response) => {
-                response.message.payload = uri_path_list.front().unwrap().clone();
-            }
-            _ => {}
+        if let Some(ref mut response) = req.response {
+            response.message.payload = uri_path_list.front().unwrap().clone();
         }
-        return req;
+        req
     }
 
     pub fn spawn_server_with_all_coap<
@@ -587,7 +630,9 @@ pub mod test {
             let addr = sock.local_addr().unwrap();
             let listener = Box::new(UdpCoapListener::from_socket(sock));
             let mut server = Server::from_listeners(vec![listener]);
-            server.disable_observe_handling(true).await;
+            // `bypass = true` sets the internal `disable_observe` flag,
+            // so the server skips its built-in observe handling.
+            server.automatic_observe_handling(true).await;
             tx.send(addr.port()).unwrap();
             server.run(request_handler).await.unwrap();
         });
@@ -777,10 +822,10 @@ pub mod test {
         let payload1_clone = payload1.clone();
         let payload2_clone = payload2.clone();
         client
-            .observe(path, move |msg| {
-                match rx.try_recv() {
-                    Ok(n) => receive_step = n,
-                    _ => (),
+            .observe(path, move |result| {
+                let msg = result.unwrap();
+                if let Ok(n) = rx.try_recv() {
+                    receive_step = n;
                 }
 
                 match receive_step {
@@ -844,7 +889,8 @@ pub mod test {
             .unwrap();
 
         client
-            .observe(path, move |msg| {
+            .observe(path, move |result| {
+                let msg = result.unwrap();
                 if msg.payload == b"21" {
                     tx.send(()).unwrap();
                 }
@@ -875,7 +921,8 @@ pub mod test {
             .unwrap();
 
         client
-            .observe(path, move |msg| {
+            .observe(path, move |result| {
+                let msg = result.unwrap();
                 assert_eq!(msg.payload, b"test".to_vec());
                 tx.send(()).unwrap();
             })
@@ -1046,7 +1093,7 @@ pub mod test {
     fn get_expected_response() -> Vec<u8> {
         let mut resp = vec![];
         for c in b'a'..=b'z' {
-            resp.extend(std::iter::repeat(c).take(1024));
+            resp.resize(resp.len() + 1024, c);
         }
         resp
     }
@@ -1055,13 +1102,10 @@ pub mod test {
     ) -> Box<CoapRequest<SocketAddr>> {
         // vec should contain 'a' 1024 times, then 'b' 1024, up to ascii 'z'
 
-        match req.response {
-            Some(ref mut response) => {
-                response.message.payload = get_expected_response();
-            }
-            _ => {}
+        if let Some(ref mut response) = req.response {
+            response.message.payload = get_expected_response();
         }
-        return req;
+        req
     }
     #[tokio::test]
     async fn test_block2_server_response() {

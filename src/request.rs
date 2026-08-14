@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, SocketAddr}, str::FromStr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 pub use coap_lite::{
     CoapOption, CoapRequest, MessageClass, MessageType, ObserveOption, Packet,
@@ -43,7 +46,7 @@ impl<'a> RequestBuilder<'a> {
         Self {
             data: payload,
             queries: query,
-            domain: domain.unwrap_or_else(|| "".to_string()),
+            domain: domain.unwrap_or_default(),
             ..new_self
         }
     }
@@ -90,11 +93,10 @@ impl<'a> RequestBuilder<'a> {
             assert_ne!(opt, CoapOption::UriQuery, "Use queries instead");
             request.message.add_option(opt, opt_data);
         }
-        if self.domain.len() != 0 && IpAddr::from_str(&self.domain).is_err() {
-            request.message.add_option(
-                CoapOption::UriHost,
-                self.domain.as_str().as_bytes().to_vec(),
-            );
+        if !self.domain.is_empty() && IpAddr::from_str(&self.domain).is_err() {
+            request
+                .message
+                .add_option(CoapOption::UriHost, self.domain.as_bytes().to_vec());
         }
         if let Some(data) = self.data {
             request.message.payload = data;
@@ -106,7 +108,7 @@ impl<'a> RequestBuilder<'a> {
         if let Some(tok) = self.token {
             request.message.set_token(tok);
         }
-        return request;
+        request
     }
 }
 #[cfg(test)]
