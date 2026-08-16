@@ -581,7 +581,8 @@ impl Observer {
                 .register_resources
                 .get_mut(&message.register_resource)
                 .unwrap();
-            if register_resource.token != *token {
+            // RFC 7252 4.2: empty ACKs carry no token, the message id identifies them
+            if !token.is_empty() && register_resource.token != *token {
                 return;
             }
 
